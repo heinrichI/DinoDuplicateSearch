@@ -72,22 +72,48 @@ embs = np.stack([embed_image(p) for p in paths]).astype("float32")
 #     print(f"{rank:02d}. score={s:.3f}  {paths[i]}")
 
 
-# Clustering images
-from sklearn.cluster import KMeans
+# Clustering images - Agglomerative Clustering (no need to specify k)
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.preprocessing import normalize
 from collections import defaultdict
 
-k = 10
-kmeans = KMeans(n_clusters=k, random_state=0, n_init="auto")
-labels = kmeans.fit_predict(embs)
+# Convert similarity threshold to distance threshold
+# distance = 1 - similarity
+# For similarity ~0.55 (emma stone case), distance = 0.45
+distance_threshold = 0.45
+
+# Embs are already L2-normalized, use cosine affinity
+agg = AgglomerativeClustering(
+    n_clusters=None,
+    distance_threshold=distance_threshold,
+    metric='cosine',
+    linkage='average'
+)
+labels = agg.fit_predict(embs)
 
 clusters = defaultdict(list)
 for p, lab in zip(paths, labels):
     clusters[int(lab)].append(p)
 
-for lab in range(k):
-    print(f"\nCluster {lab} ({len(clusters[lab])} images)")
-    for p in clusters[lab][:5]:
-        print("  ", p)
+# Create path to index mapping for similarity lookups
+path_to_idx = {p: i for i, p in enumerate(paths)}
+
+print("\n" + "="*60)
+print("AGGLOMERATIVE CLUSTERING RESULTS")
+print(f"Distance threshold: {distance_threshold} (similarity ~{1-distance_threshold:.2f})")
+print("="*60)
+
+for lab in sorted(clusters.keys()):
+    items = clusters[lab]
+    print(f"\nCluster {lab} ({len(items)} images)")
+    if len(items) == 1:
+        print("  ", os.path.basename(items[0]))
+    else:
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                idx1, idx2 = path_to_idx[items[i]], path_to_idx[items[j]]
+                sim = float(np.dot(embs[idx1], embs[idx2]))
+                print(f"  [{sim:.4f}] {os.path.basename(items[i])} <-> {os.path.basename(items[j])}")
 
 # DEBUG: Show pairwise similarities within KMeans clusters
 def print_cluster_pairwise_similarities(clusters, embs, paths, threshold):
@@ -152,15 +178,25 @@ for i, label in enumerate(labels):
 
 # 2. Print only clusters that contain more than one image (actual duplicates)
 print(f"\nFound {n_comp} total groups. Printing duplicate clusters:\n")
+print("="*60)
+print("FAISS DUPLICATE CLUSTERS")
+print("="*60)
+
+# Create path to index mapping for similarity lookups
+path_to_idx = {p: i for i, p in enumerate(paths)}
 
 duplicate_count = 0
 for label, items in clusters.items():
     if len(items) > 1:
         duplicate_count += 1
-        print(f"--- Cluster {duplicate_count} ({len(items)} images) ---")
-        for p in items:
-            print(f"  {p}")
-        print()
+        print(f"\n--- Cluster {duplicate_count} ({len(items)} images) ---")
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                idx1, idx2 = path_to_idx[items[i]], path_to_idx[items[j]]
+                sim = float(np.dot(embs[idx1], embs[idx2]))
+                print(f"  [{sim:.4f}] {os.path.basename(items[i])}")
+                print(f"  [{sim:.4f}] {os.path.basename(items[j])}")
+                print()
 
 if duplicate_count == 0:
     print("No duplicates found with the current threshold.")
