@@ -32,6 +32,14 @@ def save_config(config: dict):
 ICONS = ft.icons.Icons
 
 
+def open_original_image(path: str):
+    """Open image in system default viewer"""
+    try:
+        os.startfile(path)
+    except Exception as e:
+        print(f"Error opening file: {e}")
+
+
 class SearchTab(ft.Tab):
     """Search Tab with content"""
     
@@ -355,6 +363,7 @@ class ResultsTab(ft.Tab):
         )
     
     def update_results(self, results: list[DuplicateGroup]):
+        print(f"[DEBUG app.py] update_results called with {len(results)} groups")
         self.results = results
         self.results_column.controls.clear()
         
@@ -370,16 +379,24 @@ class ResultsTab(ft.Tab):
                 )
             )
         else:
-            for i, group in enumerate(results):
-                self.results_column.controls.append(
-                    self._create_group_card(group, i)
-                )
+            try:
+                for i, group in enumerate(results):
+                    print(f"[DEBUG app.py] Creating card {i}/{len(results)}")
+                    card = self._create_group_card(group, i)
+                    print(f"[DEBUG app.py] Card {i} created, appending to column")
+                    self.results_column.controls.append(card)
+                    print(f"[DEBUG app.py] Card {i} appended, total controls: {len(self.results_column.controls)}")
+            except Exception as ex:
+                print(f"[DEBUG app.py] ERROR in card creation loop: {ex}")
+                import traceback
+                traceback.print_exc()
         
         self.count_text.value = f"Found: {len(results)} groups"
         self.page.update() if self.page else None
     
     def _create_group_card(self, group: DuplicateGroup, index: int) -> ft.Card:
         """Create a card widget for a duplicate group"""
+        print(f"[DEBUG app.py] _create_group_card called for index={index}, paths={len(group.paths)}")
         paths = group.paths
         
         # Group header with geometric info
@@ -416,20 +433,26 @@ class ResultsTab(ft.Tab):
         
         for img_path in image_paths:
             basename = os.path.basename(img_path)
-            thumbnails.controls.append(
-                ft.Container(
-                    content=ft.Column([
-                        ft.Image(
-                            src=img_path,
-                            border_radius=ft.BorderRadius.all(8),
-                            width=100,
-                            height=100,
-                        ),
-                        ft.Text(basename[:20], size=8, tooltip=basename),
-                    ], spacing=2),
-                    alignment=ft.Alignment(0, 0),
-                )
+            # Container with click to show path in tooltip
+            img_container = ft.Container(
+                content=ft.Column([
+                    ft.Image(
+                        src=img_path,
+                        border_radius=ft.BorderRadius.all(8),
+                        width=100,
+                        height=100,
+                    ),
+                    ft.Text(basename[:20], size=8, tooltip=img_path),
+                ], spacing=2),
+                alignment=ft.Alignment(0, 0)
             )
+            # Оборачиваем в GestureDetector, чтобы поймать двойной тап
+            tappable = ft.GestureDetector(
+                content=img_container,
+                on_double_tap=lambda e, path=img_path: open_original_image(path),
+                # Можно добавить on_tap для обычного клика, если нужно
+            )
+            thumbnails.controls.append(tappable)
         
         tile_content = ft.Column([
             header,

@@ -298,9 +298,16 @@ class DuplicatesFinder:
         groups: List[DuplicateGroup] = []
         group_id = 0
         
+        print(f"[DEBUG] enable_geometric_check = {enable_geometric_check}")
+        
         if enable_geometric_check:
             # Group by Union-Find roots (WGC connectivity)
             uf_groups = uf.get_groups()
+            print(f"[DEBUG] uf_groups = {uf_groups}")
+            print(f"[DEBUG] all_pairs count = {len(all_pairs)}")
+            verified_count = sum(1 for p, _, _ in all_pairs if p.geometric_verified)
+            print(f"[DEBUG] verified pairs = {verified_count}")
+            
             for root, group_paths in uf_groups.items():
                 if len(group_paths) < 2:
                     continue
