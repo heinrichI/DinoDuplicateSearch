@@ -1,3 +1,7 @@
+# DinoDuplicateSearch
+
+Install
+
 pip install -U torch torchvision transformers pillow
 # optional, for the later examples:
 pip install -U numpy scikit-learn faiss-cpu

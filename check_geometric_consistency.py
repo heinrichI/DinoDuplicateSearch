@@ -1,6 +1,9 @@
 #=====================================================================
-# ШАГ 2: Точная проверка геометрии через SIFT и WGC (Weak Geometric Consistency)
+# ШАГ 2: Точнаяn (Weak Geometric Consistency)
 # =====================================================================
+
+import cv2
+import numpy as np
 
 def extract_sift_features(image):
     """Извлекает ключевые точки и дескрипторы SIFT"""
@@ -8,12 +11,15 @@ def extract_sift_features(image):
     keypoints, descriptors = sift.detectAndCompute(image, None)
     return keypoints, descriptors
 
-def check_geometric_consistency(kp_query, des_query, kp_candidate, des_candidate):
+def check_geometric_consistency(kp_query, des_query, kp_candidate, des_candidate, threshold_ratio=0.3):
     """
     Проверяет согласованность угла и масштаба (WGC) между двумя картинками.
+    
+    Args:
+        threshold_ratio: минимальная доля совпадений с одинаковым углом/масштабом (по умолчанию 0.3 = 30%)
     """
     if des_query is None or des_candidate is None:
-        return False, 0, 0
+        return False, 0, 0, 0, 0
         
     # Находим соответствия через Brute-Force матчер
     bf = cv2.BFMatcher()
@@ -26,7 +32,7 @@ def check_geometric_consistency(kp_query, des_query, kp_candidate, des_candidate
             good_matches.append(m)
             
     if len(good_matches) < 10:
-        return False, 0, 0 # Слишком мало общих точек
+        return False, 0, 0, 0, 0  # Too few common points
         
     angles = []
     scales = []
@@ -58,8 +64,8 @@ def check_geometric_consistency(kp_query, des_query, kp_candidate, des_candidate
     hist_scales, bins_scales = np.histogram(log_scales, bins=20, range=(-3, 3))
     max_scale_votes = np.max(hist_scales)
     
-    # Условие прохождения WGC: более 50% хороших точек должны иметь одинаковый угол и масштаб
-    threshold = len(good_matches) * 0.5
+    # Условие прохождения WGC: порог определяется параметром threshold_ratio
+    threshold = len(good_matches) * threshold_ratio
     
     is_valid = (max_angle_votes > threshold) and (max_scale_votes > threshold)
     
@@ -71,6 +77,6 @@ def check_geometric_consistency(kp_query, des_query, kp_candidate, des_candidate
         best_scale_bin = np.argmax(hist_scales)
         avg_scale = 2**((bins_scales[best_scale_bin] + bins_scales[best_scale_bin+1]) / 2)
         
-        return True, avg_angle, avg_scale
+        return True, avg_angle, avg_scale, max_angle_votes, max_scale_votes
         
-    return False, 0, 0
+    return False, 0, 0, 0, 0

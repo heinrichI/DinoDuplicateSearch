@@ -76,10 +76,36 @@ embs = np.stack([embed_image(p) for p in paths]).astype("float32")
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.preprocessing import normalize
 from collections import defaultdict
+from check_geometric_consistency import extract_sift_features, check_geometric_consistency
+from duplicates_finder import UnionFind
+import cv2
+
+# Cache for SIFT features
+_sift_cache = {}
+
+def get_sift_features(path):
+    """Get cached SIFT features"""
+    if path not in _sift_cache:
+        img = cv2.imread(path)
+        if img is None:
+            return None, None
+        kp, des = extract_sift_features(img)
+        _sift_cache[path] = (kp, des)
+    return _sift_cache[path]
+
+def check_wgc_pair(path1, path2, threshold_ratio=0.3):
+    """Check WGC for a pair of images"""
+    try:
+        kp1, des1 = get_sift_features(path1)
+        kp2, des2 = get_sift_features(path2)
+        if des1 is None or des2 is None:
+            return False, 0, 0, 0, 0
+        return check_geometric_consistency(kp1, des1, kp2, des2, threshold_ratio)
+    except Exception as e:
+        print(f"    Warning: WGC check failed: {e}")
+        return False, 0, 0, 0, 0
 
 # Convert similarity threshold to distance threshold
-# distance = 1 - similarity
-# For similarity ~0.55 (emma stone case), distance = 0.45
 distance_threshold = 0.45
 
 # Embs are already L2-normalized, use cosine affinity
@@ -98,22 +124,46 @@ for p, lab in zip(paths, labels):
 # Create path to index mapping for similarity lookups
 path_to_idx = {p: i for i, p in enumerate(paths)}
 
+# Union-Find for WGC-based grouping
+uf = UnionFind()
+wgc_pairs = []  # Store all WGC-verified pairs
+
 print("\n" + "="*60)
 print("AGGLOMERATIVE CLUSTERING RESULTS")
 print(f"Distance threshold: {distance_threshold} (similarity ~{1-distance_threshold:.2f})")
 print("="*60)
 
+# First pass: find all WGC-verified pairs and union them
 for lab in sorted(clusters.keys()):
     items = clusters[lab]
-    print(f"\nCluster {lab} ({len(items)} images)")
-    if len(items) == 1:
-        print("  ", os.path.basename(items[0]))
-    else:
+    if len(items) > 1:
         for i in range(len(items)):
             for j in range(i + 1, len(items)):
-                idx1, idx2 = path_to_idx[items[i]], path_to_idx[items[j]]
-                sim = float(np.dot(embs[idx1], embs[idx2]))
-                print(f"  [{sim:.4f}] {os.path.basename(items[i])} <-> {os.path.basename(items[j])}")
+                geo_ok, angle, scale, a_votes, s_votes = check_wgc_pair(items[i], items[j])
+                if geo_ok:
+                    uf.union(items[i], items[j])
+                    wgc_pairs.append((items[i], items[j], angle, a_votes, scale, s_votes))
+
+# Get WGC groups
+uf_groups = uf.get_groups()
+
+print("\n" + "="*60)
+print("WGC-BASED CLUSTERING RESULTS")
+print("="*60)
+
+group_id = 0
+for root, group_paths in sorted(uf_groups.items(), key=lambda x: x[0]):
+    if len(group_paths) < 2:
+        continue
+    
+    group_id += 1
+    print(f"\nGroup {group_id} ({len(group_paths)} images)")
+    for p1, p2, angle, a_votes, scale, s_votes in wgc_pairs:
+        if p1 in group_paths and p2 in group_paths:
+            idx1, idx2 = path_to_idx[p1], path_to_idx[p2]
+            sim = float(np.dot(embs[idx1], embs[idx2]))
+            geo_str = f"OK WGC (angle {angle:.0f}deg {a_votes}v scale {scale:.2f} {s_votes}v)"
+            print(f"  [{sim:.4f}] {os.path.basename(p1)} <-> {os.path.basename(p2)} {geo_str}")
 
 # DEBUG: Show pairwise similarities within KMeans clusters
 def print_cluster_pairwise_similarities(clusters, embs, paths, threshold):
