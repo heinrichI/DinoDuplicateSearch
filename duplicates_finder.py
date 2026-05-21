@@ -3,8 +3,9 @@ Duplicates Finder - Core logic for finding duplicate images
 Uses DINOv2 embeddings + Agglomerative Clustering + SIFT/WGC geometric verification
 """
 import os
+import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Set
 import cv2
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from PIL import Image
 from sklearn.cluster import AgglomerativeClustering
 from transformers import AutoImageProcessor, AutoModel
 from check_geometric_consistency import extract_sift_features, check_geometric_consistency
+from feature_cache import FeatureCache
 
 
 def _read_image_cv2(path: str) -> np.ndarray:
@@ -131,6 +133,7 @@ class DuplicatesFinder:
         self.device = None
         self._sift_cache: Dict[str, Tuple] = {}
         self._progress_callback = None  # Store callback for use in embed_image
+        self._cache = FeatureCache()
     
     def _load_model(self):
         """Lazy loading of DINOv2 model"""
@@ -150,7 +153,25 @@ class DuplicatesFinder:
     
     @torch.no_grad()
     def embed_image(self, path: str) -> np.ndarray:
-        """Extract DINOv2 CLS embedding from an image"""
+        """Extract DINOv2 CLS embedding from an image with SQLite caching"""
+        # Get current file modification time
+        current_mtime = 0.0
+        try:
+            current_mtime = os.path.getmtime(path)
+        except (OSError, Exception):
+            pass
+
+        # Check persistent cache first
+        try:
+            cached = self._cache.get_embedding(path)
+            if cached is not None:
+                cached_mtime, embedding = cached
+                if abs(cached_mtime - current_mtime) < 0.01:
+                    return embedding
+        except Exception:
+            pass  # On any error, recompute
+
+        # Compute embedding
         self._load_model()
         
         img = Image.open(path).convert("RGB")
@@ -160,7 +181,15 @@ class DuplicatesFinder:
         cls = outputs.last_hidden_state[:, 0]  # CLS token
         cls = torch.nn.functional.normalize(cls, dim=-1)
         
-        return cls[0].cpu().numpy()
+        embedding = cls[0].cpu().numpy()
+
+        # Save to persistent cache
+        try:
+            self._cache.set_embedding(path, current_mtime, embedding)
+        except Exception:
+            pass
+
+        return embedding
     
     @staticmethod
     def list_images(folder: str) -> List[str]:
@@ -348,6 +377,13 @@ class DuplicatesFinder:
                 if group.pairs:
                     groups.append(group)
         
+        # Clean up stale cache entries (files no longer in folder)
+        try:
+            path_set = set(paths)
+            self._cache.remove_entries_not_in(path_set)
+        except Exception:
+            pass
+
         if progress_callback:
             progress_callback(100, f"Found {len(groups)} duplicate groups")
         
@@ -371,11 +407,40 @@ class DuplicatesFinder:
         return check_geometric_consistency(kp1, des1, kp2, des2, threshold_ratio)
     
     def _get_sift_features(self, path: str) -> Tuple:
-        """Get cached SIFT features for an image"""
-        if path not in self._sift_cache:
-            img = _read_image_cv2(path)
-            if img is None:
-                return None, None
-            kp, des = extract_sift_features(img)
-            self._sift_cache[path] = (kp, des)
-        return self._sift_cache[path]
+        """Get SIFT features with SQLite caching"""
+        # Check in-memory cache first (fastest)
+        if path in self._sift_cache:
+            return self._sift_cache[path]
+
+        # Get current file modification time
+        current_mtime = 0.0
+        try:
+            current_mtime = os.path.getmtime(path)
+        except (OSError, Exception):
+            pass
+
+        # Check persistent SQLite cache
+        try:
+            cached = self._cache.get_sift(path)
+            if cached is not None:
+                cached_mtime, kp, des = cached
+                if abs(cached_mtime - current_mtime) < 0.01:
+                    self._sift_cache[path] = (kp, des)
+                    return kp, des
+        except Exception:
+            pass
+
+        # Compute SIFT features
+        img = _read_image_cv2(path)
+        if img is None:
+            return None, None
+        kp, des = extract_sift_features(img)
+
+        # Save to both caches
+        self._sift_cache[path] = (kp, des)
+        try:
+            self._cache.set_sift(path, current_mtime, kp, des)
+        except Exception:
+            pass
+
+        return kp, des

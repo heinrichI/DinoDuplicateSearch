@@ -92,6 +92,11 @@ class SearchScreen(Screen):
         self.finder = DuplicatesFinder()
         self.search_thread = None
         self._progress_popup = None
+        # Load last directory into the input field
+        config = load_config()
+        last_dir = config.get("last_directory")
+        if last_dir:
+            Clock.schedule_once(lambda dt, d=last_dir: setattr(self.ids.directory_input, 'text', d))
 
     def on_threshold_change(self, value):
         """Update threshold label when slider changes"""
