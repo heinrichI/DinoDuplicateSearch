@@ -3,7 +3,7 @@ pip install -U torch torchvision transformers pillow
 pip install -U numpy scikit-learn faiss-cpu
 
 # For desktop GUI application:
-pip install flet opencv-python
+pip install kivy opencv-python
 
-# Run the Flet app:
+# Run the Kivy app:
 python app.py

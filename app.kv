@@ -1,0 +1,237 @@
+#:kivy 2.0
+
+<SearchScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 20
+        spacing: 10
+
+        # Top navigation bar
+        BoxLayout:
+            size_hint_y: None
+            height: 48
+            spacing: 0
+
+            Button:
+                text: 'Search'
+                font_size: 16
+                background_color: 0.2, 0.6, 1.0, 1.0
+                color: 1, 1, 1, 1
+                disabled: True
+
+            Button:
+                text: 'Results'
+                font_size: 16
+                background_color: 0.8, 0.8, 0.8, 1.0
+                on_release: root.switch_to_results()
+
+        # Directory selection
+        Label:
+            text: 'Select Directory'
+            font_size: 20
+            bold: True
+            size_hint_y: None
+            height: 30
+
+        BoxLayout:
+            size_hint_y: None
+            height: 40
+            spacing: 5
+
+            TextInput:
+                id: directory_input
+                hint_text: 'Enter folder path or use Browse button...'
+                multiline: False
+                readonly: False
+
+            Button:
+                text: 'Browse...'
+                size_hint_x: 0.3
+                on_release: root.on_browse_click()
+
+        # Settings section
+        Label:
+            text: 'Settings'
+            font_size: 20
+            bold: True
+            size_hint_y: None
+            height: 30
+
+        Label:
+            text: 'Distance Threshold (lower = stricter):'
+            size_hint_y: None
+            height: 20
+
+        BoxLayout:
+            size_hint_y: None
+            height: 40
+            spacing: 10
+
+            Slider:
+                id: threshold_slider
+                min: 0.01
+                max: 1.0
+                value: 0.45
+                step: 0.01
+                on_value: root.on_threshold_change(self.value)
+
+            Label:
+                id: threshold_value_label
+                text: '0.45'
+                size_hint_x: 0.1
+
+        BoxLayout:
+            size_hint_y: None
+            height: 40
+            spacing: 5
+
+            CheckBox:
+                id: geometric_check
+                active: True
+
+            Label:
+                text: 'Enable geometric verification (SIFT/WGC)'
+
+        BoxLayout:
+            size_hint_y: None
+            height: 40
+            spacing: 10
+
+            Slider:
+                id: wgc_threshold_slider
+                min: 0.1
+                max: 0.9
+                value: 0.30
+                step: 0.05
+                on_value: root.on_wgc_threshold_change(self.value)
+
+            Label:
+                id: wgc_threshold_value_label
+                text: '0.30'
+                size_hint_x: 0.1
+
+        # Find button
+        Button:
+            id: find_button
+            text: 'Find Duplicates'
+            font_size: 16
+            size_hint_y: None
+            height: 48
+            background_color: 0.2, 0.6, 1.0, 1.0
+            on_release: root.on_find_duplicates()
+
+        # Spacer
+        Widget:
+            size_hint_y: 1
+
+<ResultsScreen>:
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 20
+        spacing: 10
+
+        # Top navigation bar
+        BoxLayout:
+            size_hint_y: None
+            height: 48
+            spacing: 0
+
+            Button:
+                text: 'Search'
+                font_size: 16
+                background_color: 0.8, 0.8, 0.8, 1.0
+                on_release: root.switch_to_search()
+
+            Button:
+                text: 'Results'
+                font_size: 16
+                background_color: 0.2, 0.6, 1.0, 1.0
+                color: 1, 1, 1, 1
+                disabled: True
+
+        # Header
+        BoxLayout:
+            size_hint_y: None
+            height: 30
+
+            Label:
+                text: 'Duplicate Groups'
+                font_size: 20
+                bold: True
+
+            Widget:
+
+            Label:
+                id: count_label
+                text: 'Found: 0 groups'
+
+        # Scrollable results
+        ScrollView:
+            id: results_scroll
+            do_scroll_x: False
+            do_scroll_y: True
+
+            GridLayout:
+                id: results_grid
+                cols: 1
+                spacing: 10
+                size_hint_y: None
+                height: self.minimum_height
+
+<FileChooserPopup>:
+    title: 'Select Folder'
+    size_hint: 0.9, 0.9
+
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 10
+        spacing: 10
+
+        FileChooserIconView:
+            id: file_chooser
+            dirselect: True
+            path: root.current_path
+
+        BoxLayout:
+            size_hint_y: None
+            height: 40
+            spacing: 10
+
+            Widget:
+                size_hint_x: 0.5
+
+            Button:
+                text: 'Cancel'
+                on_release: root.dismiss()
+
+            Button:
+                text: 'Select'
+                background_color: 0.2, 0.6, 1.0, 1.0
+                color: 1, 1, 1, 1
+                on_release: root.on_select()
+
+<ProgressPopup>:
+    title: 'Searching...'
+    size_hint: 0.7, 0.4
+    auto_dismiss: False
+
+    BoxLayout:
+        orientation: 'vertical'
+        padding: 20
+        spacing: 15
+
+        ProgressBar:
+            id: progress_bar
+            max: 100.0
+            value: 0.0
+
+        Label:
+            id: stage_label
+            text: 'Initializing...'
+            font_size: 14
+
+        Label:
+            id: file_label
+            text: ''
+            font_size: 12
+            italic: True

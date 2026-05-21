@@ -1,11 +1,27 @@
 """
-Flet Desktop Application for Finding Duplicate Images
+Kivy Desktop Application for Finding Duplicate Images
 """
-import flet as ft
 import os
 import json
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import traceback
+from functools import partial
+
+import kivy
+kivy.require('2.0.0')
+
+from kivy.app import App
+from kivy.lang import Builder
+from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.popup import Popup
+from kivy.uix.image import Image as KivyImage
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.label import Label
+from kivy.clock import Clock
+from kivy.properties import StringProperty
+from kivy.core.window import Window
+
 from duplicates_finder import DuplicatesFinder, DuplicateGroup
 
 # Config file for persistent settings
@@ -28,9 +44,6 @@ def save_config(config: dict):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f)
 
-# Icon shortcuts for Flet 0.84.0
-ICONS = ft.icons.Icons
-
 
 def open_original_image(path: str):
     """Open image in system default viewer"""
@@ -40,561 +53,403 @@ def open_original_image(path: str):
         print(f"Error opening file: {e}")
 
 
-class SearchTab(ft.Tab):
-    """Search Tab with content"""
-    
-    def __init__(self, finder: DuplicatesFinder, on_results_ready, switch_tabs_callback=None):
-        # Initialize flet Tab first
-        super().__init__(
-            label="Search",
-            icon=ICONS.SEARCH_OUTLINED,
-        )
-        
-        # Then set our custom attributes
-        self.finder = finder
-        self.on_results_ready = on_results_ready
-        self.switch_tabs_callback = switch_tabs_callback
-        self.results = []
-        
-        # Queue for thread-safe progress updates
-        self._progress_queue = asyncio.Queue()
-        
-        # Initialize UI elements
-        self.geometric_check = ft.Switch(
-            label="Enable geometric verification (SIFT/WGC)",
-            value=True
-        )
-        self.wgc_threshold_text = ft.Text("0.30")
-        self.wgc_threshold_slider = ft.Slider(
-            min=0.1,
-            max=0.9,
-            value=0.30,
-            divisions=16,
-            on_change=self._on_wgc_threshold_change,
-        )
-        self.file_picker = ft.FilePicker()
-        self.directory_input = ft.TextField(
-            label="Directory Path",
-            hint_text="Enter folder path or use Browse button...",
-            expand=True
-        )
-        self.threshold_value_text = ft.Text("0.45")
-        self.threshold_slider = ft.Slider(
-            min=0.01,
-            max=1.0,
-            value=0.45,
-            divisions=99,
-            on_change=self._on_threshold_change,
-        )
-        
-        # Progress dialog with detailed status
-        self.progress_bar_for_dialog = ft.ProgressBar(width=300)
-        self.progress_stage_text = ft.Text("Initializing...", size=12)
-        self.progress_file_text = ft.Text("", size=10, italic=True)
-        self.progress_dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Searching...", weight=ft.FontWeight.BOLD),
-            content=ft.Column([
-                self.progress_bar_for_dialog,
-                self.progress_stage_text,
-                self.progress_file_text,
-            ], spacing=5),
-            actions=[],
-        )
-        
-        # Find Duplicates button - store reference to disable during search
-        self.find_duplicates_button = ft.Button(
-            "Find Duplicates",
-            icon=ICONS.SEARCH_OUTLINED,
-            on_click=self._on_find_duplicates_click
-        )
-        
-        self.content = self._build_content()
-        
-        # Load last directory from config
+class FileChooserPopup(Popup):
+    """Popup with file chooser for selecting a directory"""
+    current_path = StringProperty(os.path.expanduser("~"))
+    selected_path = StringProperty("")
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Load last directory from config as starting point
         config = load_config()
         if config.get("last_directory"):
-            self.directory_input.value = config["last_directory"]
-        
-    def _on_threshold_change(self, e):
-        self.threshold_value_text.value = f"{e.control.value:.2f}"
-        # Note: No need to call self.page.update() here - the Text updates automatically
-        # when placed in a Container that is already on the page
-    
-    def _on_wgc_threshold_change(self, e):
-        self.wgc_threshold_text.value = f"{e.control.value:.2f}"
-    
-    def _build_content(self):
-        return ft.Container(
-            content=ft.Column([
-                ft.Text("Select Directory", size=20, weight=ft.FontWeight.BOLD),
-                ft.Row([
-                    self.directory_input,
-                    ft.Button(
-                        "Browse...",
-                        icon=ICONS.FOLDER_OPEN_OUTLINED,
-                        on_click=self._on_browse_click
-                    ),
-                ]),
-                ft.Divider(),
-                ft.Text("Settings", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text("Distance Threshold (lower = stricter):"),
-                ft.Row([self.threshold_slider, self.threshold_value_text]),
-                self.geometric_check,
-                ft.Row([self.wgc_threshold_slider, self.wgc_threshold_text]),
-                ft.Divider(),
-                # Use stored button reference
-                self.find_duplicates_button,
-            ], spacing=10),
-            padding=20,
-        )
-    
-    def _get_page(self):
-        """Safely get page reference"""
-        try:
-            return self.page if hasattr(self, 'page') else None
-        except RuntimeError:
-            return None
-    
-    def _update_page(self):
-        page = self._get_page()
-        if page:
-            page.update()
-    
-    async def _on_browse_click(self, e):
-        result = await self.file_picker.get_directory_path()
-        if result:
-            self.directory_input.value = result
-            self._update_page()
-    
-    async def _on_find_duplicates_click(self, e):
-        folder = self.directory_input.value
+            self.current_path = config["last_directory"]
+
+    def on_select(self):
+        """Called when user clicks Select"""
+        file_chooser = self.ids.file_chooser
+        if file_chooser.path and file_chooser.selection:
+            selected = file_chooser.selection[0]
+            if os.path.isdir(selected):
+                self.selected_path = selected
+            else:
+                self.selected_path = file_chooser.path
+        else:
+            self.selected_path = file_chooser.path
+        self.dismiss()
+
+
+class ProgressPopup(Popup):
+    """Popup with progress bar for long operations"""
+    pass
+
+
+class SearchScreen(Screen):
+    """Search screen with directory picker, settings, and find button"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.finder = DuplicatesFinder()
+        self.search_thread = None
+        self._progress_popup = None
+
+    def on_threshold_change(self, value):
+        """Update threshold label when slider changes"""
+        label = self.ids.threshold_value_label
+        label.text = f"{value:.2f}"
+
+    def on_wgc_threshold_change(self, value):
+        """Update WGC threshold label when slider changes"""
+        label = self.ids.wgc_threshold_value_label
+        label.text = f"{value:.2f}"
+
+    def on_browse_click(self):
+        """Open file chooser popup"""
+        popup = FileChooserPopup()
+        popup.bind(on_dismiss=lambda instance: self._on_folder_selected(instance.selected_path))
+        popup.open()
+
+    def _on_folder_selected(self, path):
+        """Called when a folder is selected in the file chooser"""
+        if path:
+            self.ids.directory_input.text = path
+
+    def switch_to_results(self):
+        """Switch to results screen"""
+        self.manager.current = 'results'
+
+    def on_find_duplicates(self):
+        """Start duplicate search in background thread"""
+        folder = self.ids.directory_input.text.strip()
         if not folder or not os.path.isdir(folder):
             self._show_error("Please select a valid directory")
             return
-        
-        # Get page reference from event
-        page = e.control.page if e.control else None
-        
-        # Show progress dialog
-        if page:
-            page.show_dialog(self.progress_dialog)
-            page.update()
-        
+
+        threshold = self.ids.threshold_slider.value
+        geo_check = self.ids.geometric_check.active
+        wgc_threshold = self.ids.wgc_threshold_slider.value
+
         # Disable button during search
-        self.find_duplicates_button.disabled = True
-        if page:
-            page.update()
-        
-        # Clear and prepare queue
-        while not self._progress_queue.empty():
-            try:
-                self._progress_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        
-        # Flag to track if search is done
-        search_done = False
-        search_results = None
-        search_error = None
-        
-        def progress_callback(percent, message):
-            """Called from background thread - put update in queue"""
-            try:
-                self._progress_queue.put_nowait((percent, message))
-            except Exception as ex:
-                print(f"Queue put error: {ex}")
-        
-        async def progress_updater():
-            """Async task that processes progress updates from queue"""
-            nonlocal search_done
-            while not search_done:
-                try:
-                    # Wait for update with timeout
-                    percent, message = await asyncio.wait_for(
-                        self._progress_queue.get(),
-                        timeout=0.1
-                    )
-                    
-                    # Update UI elements
-                    self.progress_bar_for_dialog.value = percent / 100
-                    self.progress_stage_text.value = message.split('\n')[0] if message else "Processing..."
-                    if '\n' in message:
-                        self.progress_file_text.value = message.split('\n', 1)[1]
-                    else:
-                        self.progress_file_text.value = ""
-                    
-                    # Update page
-                    if page:
-                        page.update()
-                        
-                except asyncio.TimeoutError:
-                    # No update in queue, check if search is done
-                    continue
-                except Exception as ex:
-                    print(f"Progress update error: {ex}")
-        
-        async def run_search():
-            """Run search in executor"""
-            nonlocal search_done, search_results, search_error
-            try:
-                loop = asyncio.get_event_loop()
-                search_results = await loop.run_in_executor(
-                    ThreadPoolExecutor(),
-                    lambda: self.finder.find_duplicates(
-                        folder_path=folder,
-                        distance_threshold=self.threshold_slider.value,
-                        enable_geometric_check=self.geometric_check.value,
-                        wgc_threshold=self.wgc_threshold_slider.value,
-                        progress_callback=progress_callback
-                    )
-                )
-            except Exception as ex:
-                search_error = ex
-            finally:
-                search_done = True
-        
+        self.ids.find_button.disabled = True
+        self.ids.find_button.text = "Searching..."
+
+        # Show progress popup
+        self._progress_popup = ProgressPopup()
+        self._progress_popup.open()
+
+        # Reset progress
+        self._progress_popup.ids.progress_bar.value = 0.0
+        self._progress_popup.ids.stage_label.text = "Initializing..."
+        self._progress_popup.ids.file_label.text = ""
+
+        # Run search in background thread
+        self.search_thread = threading.Thread(
+            target=self._run_search_thread,
+            args=(folder, threshold, geo_check, wgc_threshold),
+            daemon=True
+        )
+        self.search_thread.start()
+
+    def _run_search_thread(self, folder, threshold, geo_check, wgc_threshold):
+        """Run search in background thread"""
+        results = []
+        error = None
         try:
-            # Run both tasks concurrently
-            await asyncio.gather(
-                run_search(),
-                progress_updater()
+            # Define progress callback that schedules UI updates
+            def progress_callback(percent, message):
+                Clock.schedule_once(
+                    lambda dt, p=percent, m=message: self._update_progress(p, m),
+                    0
+                )
+
+            results = self.finder.find_duplicates(
+                folder_path=folder,
+                distance_threshold=threshold,
+                enable_geometric_check=geo_check,
+                wgc_threshold=wgc_threshold,
+                progress_callback=progress_callback
             )
-            
-            # Re-enable button
-            self.find_duplicates_button.disabled = False
-            
-            # Close progress dialog
-            if page:
-                page.pop_dialog()
-                page.update()
-            
-            # Handle errors
-            if search_error:
-                self._show_error(f"Error: {str(search_error)}")
-                return
-            
-            # Save last directory
-            config = load_config()
-            config["last_directory"] = folder
-            save_config(config)
-            
-            # Switch to results tab
-            if self.switch_tabs_callback:
-                self.switch_tabs_callback()
-            
-            if page:
-                page.update()
-            
-            # Small delay then show results
-            await asyncio.sleep(0.1)
-            self.on_results_ready(search_results or [])
-            
-            if page:
-                page.update()
-            
         except Exception as ex:
-            self.find_duplicates_button.disabled = False
-            if page:
-                page.pop_dialog()
-                page.update()
-            self._show_error(f"Error: {str(ex)}")
-    
+            error = ex
+            traceback.print_exc()
+
+        # Schedule completion on main thread
+        Clock.schedule_once(
+            lambda dt, r=results, e=error: self._on_search_complete(r, e, folder),
+            0
+        )
+
+    def _update_progress(self, percent, message):
+        """Update progress popup from main thread"""
+        if self._progress_popup is None:
+            return
+        popup = self._progress_popup
+        popup.ids.progress_bar.value = float(percent)
+
+        if '\n' in message:
+            lines = message.split('\n', 1)
+            popup.ids.stage_label.text = lines[0]
+            popup.ids.file_label.text = lines[1] if len(lines) > 1 else ""
+        else:
+            popup.ids.stage_label.text = message
+            popup.ids.file_label.text = ""
+
+    def _on_search_complete(self, results, error, folder):
+        """Called when search completes"""
+        # Re-enable button
+        self.ids.find_button.disabled = False
+        self.ids.find_button.text = "Find Duplicates"
+
+        # Dismiss progress popup
+        if self._progress_popup:
+            self._progress_popup.dismiss()
+            self._progress_popup = None
+
+        # Handle errors
+        if error:
+            self._show_error(f"Error: {str(error)}")
+            return
+
+        # Save last directory to config
+        config = load_config()
+        config["last_directory"] = folder
+        save_config(config)
+
+        # Send results to results screen
+        results_screen = self.manager.get_screen('results')
+        results_screen.update_results(results)
+
+        # Switch to results tab
+        self.manager.current = 'results'
+
     def _show_error(self, message: str):
-        page = self._get_page()
-        if page:
-            page.show_snack_bar(ft.SnackBar(content=ft.Text(message)))
-    
-    def did_mount(self):
-        self.page.overlay.append(self.file_picker)
-        # Note: progress_dialog is added in main() to avoid duplicates
+        """Show error message in a popup"""
+        popup = Popup(
+            title="Error",
+            content=Label(text=message),
+            size_hint=(0.6, 0.3)
+        )
+        popup.open()
 
 
-class ResultsTab(ft.Tab):
-    """Results Tab with duplicate groups"""
-    
-    def __init__(self):
-        self.results = []
-        self.results_column = ft.ListView(expand=True, spacing=10)
-        self.count_text = ft.Text("Found: 0 groups")
-        
-        super().__init__(
-            label="Results",
-            icon=ICONS.LIST_OUTLINED,
-        )
-        
-        self.content = self._build_content()
-        
-        # Show placeholder initially
-        self._show_placeholder()
-    
-    def _show_placeholder(self):
-        """Show placeholder message when no results"""
-        self.results_column.controls.clear()
-        self.results_column.controls.append(
-            ft.Container(
-                content=ft.Column([
-                    ft.Icon(ICONS.SEARCH_OFF, size=48),
-                    ft.Text("Run search in Search tab first", size=16),
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                alignment=ft.Alignment(0, 0),
-                padding=50,
-            )
-        )
-        self.count_text.value = "Found: 0 groups"
-        try:
-            if self.page:
-                self.page.update()
-        except:
-            pass
-    
-    def _build_content(self):
-        return ft.Container(
-            content=ft.Column([
-                ft.Row([
-                    ft.Text("Duplicate Groups", size=20, weight=ft.FontWeight.BOLD),
-                    ft.Container(expand=True),
-                    self.count_text,
-                ]),
-                ft.Divider(),
-                self.results_column,
-            ], spacing=10),
-            padding=20,
-        )
-    
-    def update_results(self, results: list[DuplicateGroup]):
-        print(f"[DEBUG app.py] update_results called with {len(results)} groups")
-        self.results = results
-        self.results_column.controls.clear()
-        
-        if not results:
-            self.results_column.controls.append(
-                ft.Container(
-                    content=ft.Column([
-                        ft.Icon(ICONS.SEARCH_OFF, size=48),
-                        ft.Text("No duplicates found", size=16),
-                    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                    alignment=ft.Alignment(0, 0),
-                    padding=50,
+class GroupCard(BoxLayout):
+    """A card widget for a duplicate group"""
+    pass
+
+
+class ResultsScreen(Screen):
+    """Results screen with duplicate groups"""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.current_cards = []
+
+    def switch_to_search(self):
+        """Switch to search screen"""
+        self.manager.current = 'search'
+
+    def update_results(self, groups):
+        """Update the results display with new duplicate groups"""
+        grid = self.ids.results_grid
+        grid.clear_widgets()
+        self.current_cards.clear()
+
+        self.ids.count_label.text = f"Found: {len(groups)} groups"
+
+        if not groups:
+            grid.add_widget(
+                BoxLayout(
+                    orientation='vertical',
+                    size_hint_y=None,
+                    height=200,
+                    padding=50
                 )
             )
-        else:
-            try:
-                for i, group in enumerate(results):
-                    print(f"[DEBUG app.py] Creating card {i}/{len(results)}")
-                    card = self._create_group_card(group, i)
-                    print(f"[DEBUG app.py] Card {i} created, appending to column")
-                    self.results_column.controls.append(card)
-                    print(f"[DEBUG app.py] Card {i} appended, total controls: {len(self.results_column.controls)}")
-            except Exception as ex:
-                print(f"[DEBUG app.py] ERROR in card creation loop: {ex}")
-                import traceback
-                traceback.print_exc()
-        
-        self.count_text.value = f"Found: {len(results)} groups"
-        self.page.update() if self.page else None
-    
-    def _create_group_card(self, group: DuplicateGroup, index: int) -> ft.Card:
+            return
+
+        for i, group in enumerate(groups):
+            card = self._build_group_card(group, i)
+            self.current_cards.append(card)
+            grid.add_widget(card)
+
+    def _build_group_card(self, group: DuplicateGroup, index: int) -> BoxLayout:
         """Create a card widget for a duplicate group"""
-        print(f"[DEBUG app.py] _create_group_card called for index={index}, paths={len(group.paths)}")
         paths = group.paths
-        
-        # Group header with geometric info
+
+        # Build subtitle text
         geo_subtitle = f"Avg similarity: {group.avg_similarity:.4f}"
         if hasattr(group, 'is_geometric_verified') and group.is_geometric_verified:
-            # Get votes from first verified pair
             for pair in group.pairs:
                 if pair.geometric_verified:
-                    geo_subtitle = f"∠ {pair.geometric_angle:.1f}° ({pair.geometric_angle_votes} votes)  × {pair.geometric_scale:.2f} ({pair.geometric_scale_votes} votes)"
+                    geo_subtitle = (
+                        f"Angle: {pair.geometric_angle:.1f}° "
+                        f"({pair.geometric_angle_votes} votes)  "
+                        f"Scale: {pair.geometric_scale:.2f} "
+                        f"({pair.geometric_scale_votes} votes)"
+                    )
                     break
-        
-        header = ft.ListTile(
-            leading=ft.Icon(ICONS.FOLDER_OUTLINED),
-            title=ft.Text(f"Group {index + 1} ({len(paths)} images)"),
-            subtitle=ft.Text(geo_subtitle),
-        )
-        
+
         # Get unique image paths
         image_paths = []
         for pair in group.pairs:
             for path in [pair.path1, pair.path2]:
                 if path not in image_paths:
                     image_paths.append(path)
-        
-        # Create GridView for thumbnails
-        thumbnails = ft.GridView(
-            expand=True,
-            runs_count=min(4, len(image_paths)),
-            max_extent=120,
-            child_aspect_ratio=1.0,
-            spacing=5,
-            run_spacing=5,
+
+        # Main card container
+        card = BoxLayout(
+            orientation='vertical',
+            size_hint_y=None,
+            height=self._calculate_card_height(len(image_paths)),
+            padding=10,
+            spacing=5
         )
-        
+
+        # Header
+        header = BoxLayout(
+            orientation='horizontal',
+            size_hint_y=None,
+            height=30
+        )
+        header.add_widget(Label(
+            text=f"Group {index + 1} ({len(paths)} images)",
+            bold=True,
+            font_size=15,
+            halign='left',
+            valign='middle'
+        ))
+        header.add_widget(Label(
+            text=geo_subtitle,
+            font_size=12,
+            halign='right',
+            valign='middle'
+        ))
+        card.add_widget(header)
+
+        # Separator
+        sep = BoxLayout(size_hint_y=None, height=2)
+        sep.canvas.before.clear()
+        with sep.canvas.before:
+            from kivy.graphics import Color, Rectangle
+            Color(0.7, 0.7, 0.7, 1)
+            Rectangle(pos=sep.pos, size=sep.size)
+        sep.bind(pos=lambda instance, value: self._update_separator(instance))
+        sep.bind(size=lambda instance, value: self._update_separator(instance))
+        card.add_widget(sep)
+
+        # Thumbnails grid
+        thumb_grid = GridLayout(
+            cols=min(4, len(image_paths)),
+            spacing=5,
+            size_hint_y=None,
+            height=self._calculate_thumbnails_height(len(image_paths))
+        )
+
         for img_path in image_paths:
             basename = os.path.basename(img_path)
-            # Container with click to show path in tooltip
-            img_container = ft.Container(
-                content=ft.Column([
-                    ft.Image(
-                        src=img_path,
-                        border_radius=ft.BorderRadius.all(8),
-                        width=100,
-                        height=100,
-                    ),
-                    ft.Text(basename[:20], size=8, tooltip=img_path),
-                ], spacing=2),
-                alignment=ft.Alignment(0, 0)
+            # Container for one thumbnail
+            thumb_container = BoxLayout(
+                orientation='vertical',
+                size_hint=(1, None),
+                height=160,
+                spacing=2
             )
-            # Оборачиваем в GestureDetector, чтобы поймать двойной тап
-            tappable = ft.GestureDetector(
-                content=img_container,
-                on_double_tap=lambda e, path=img_path: open_original_image(path),
-                # Можно добавить on_tap для обычного клика, если нужно
+
+            # Image widget
+            try:
+                img = KivyImage(
+                    source=img_path,
+                    size_hint=(1, 0.8),
+                    allow_stretch=True,
+                    keep_ratio=True
+                )
+            except Exception:
+                img = Label(text="[No preview]", size_hint=(1, 0.8))
+
+            # Double-tap detection
+            img.bind(on_touch_down=partial(self._on_thumbnail_touch, img_path))
+
+            # Filename label
+            name_label = Label(
+                text=basename[:20] + ('...' if len(basename) > 20 else ''),
+                font_size=10,
+                size_hint=(1, 0.2),
+                text_size=(140, None),
+                halign='center'
             )
-            thumbnails.controls.append(tappable)
-        
-        tile_content = ft.Column([
-            header,
-            ft.Divider(),
-            ft.Container(
-                content=thumbnails,
-                height=min(250, 60 + len(image_paths) * 65),
-            ),
-        ], spacing=5)
-        
-        return ft.Card(content=tile_content, elevation=2)
+
+            thumb_container.add_widget(img)
+            thumb_container.add_widget(name_label)
+            thumb_grid.add_widget(thumb_container)
+
+        card.add_widget(thumb_grid)
+
+        # Card border using canvas
+        card.canvas.before.clear()
+        with card.canvas.before:
+            from kivy.graphics import Color, Rectangle, Line
+            Color(0.9, 0.9, 0.9, 1)
+            Rectangle(pos=card.pos, size=card.size)
+            Color(0.6, 0.6, 0.6, 1)
+            Line(rectangle=(card.x, card.y, card.width, card.height), width=1)
+        card.bind(pos=lambda instance, value: self._redraw_card_border(instance))
+        card.bind(size=lambda instance, value: self._redraw_card_border(instance))
+
+        return card
+
+    def _calculate_card_height(self, num_paths):
+        """Calculate card height based on number of images"""
+        if num_paths <= 4:
+            return 220
+        elif num_paths <= 8:
+            return 380
+        else:
+            return 540
+
+    def _calculate_thumbnails_height(self, num_paths):
+        """Calculate thumbnails area height"""
+        rows = (num_paths + 3) // 4  # ceil division
+        return rows * 170
+
+    def _on_thumbnail_touch(self, img_path, instance, touch):
+        """Handle double-tap on thumbnail to open original image"""
+        if instance.collide_point(*touch.pos) and touch.is_double_tap:
+            open_original_image(img_path)
+
+    def _update_separator(self, instance):
+        """Redraw separator line"""
+        instance.canvas.before.clear()
+        with instance.canvas.before:
+            from kivy.graphics import Color, Rectangle
+            Color(0.7, 0.7, 0.7, 1)
+            Rectangle(pos=instance.pos, size=instance.size)
+
+    def _redraw_card_border(self, instance):
+        """Redraw card background and border"""
+        instance.canvas.before.clear()
+        with instance.canvas.before:
+            from kivy.graphics import Color, Rectangle, Line
+            Color(0.95, 0.95, 0.95, 1)
+            Rectangle(pos=instance.pos, size=instance.size)
+            Color(0.6, 0.6, 0.6, 1)
+            Line(rectangle=(instance.x, instance.y, instance.width, instance.height), width=1)
 
 
-class StyledTabButton(ft.Container):
-    """A tab button with underline styling"""
-    
-    def __init__(self, label: str, icon: str, is_selected: bool, on_click):
-        self.label = label
-        self.is_selected = is_selected
-        self.on_click_handler = on_click
-        
-        # Border color based on selection
-        border_color = ft.Colors.PRIMARY if is_selected else ft.Colors.TRANSPARENT
-        
-        super().__init__(
-            content=ft.Row([
-                ft.Icon(icon, size=18),
-                ft.Text(label, size=14, weight=ft.FontWeight.W_500),
-            ], spacing=6, alignment=ft.MainAxisAlignment.CENTER),
-            padding=ft.Padding(left=16, top=12, right=16, bottom=12),
-            border=ft.Border.only(bottom=ft.border.BorderSide(2, border_color)),
-            on_click=self._handle_click,
-        )
-    
-    def _handle_click(self, e):
-        if self.on_click_handler:
-            self.on_click_handler()
-    
-    def set_selected(self, selected: bool):
-        self.is_selected = selected
-        border_color = ft.Colors.PRIMARY if selected else ft.Colors.TRANSPARENT
-        self.border = ft.Border.only(bottom=ft.border.BorderSide(2, border_color))
-        try:
-            if self.page:
-                self.update()
-        except RuntimeError:
-            pass
+class DinoDuplicateApp(App):
+    """Main Kivy application"""
+    title = "DINOv2 Duplicate Finder"
 
-
-class TabsControl(ft.Container):
-    """Custom tabs implementation with underline styling"""
-    
-    def __init__(self, tabs_list: list[ft.Tab], on_change=None):
-        self.tabs_list = tabs_list
-        self.on_change = on_change
-        self.selected_index = 0
-        self.tab_buttons: list[StyledTabButton] = []
-        
-        # Store reference for switching tabs from outside
-        self._switch_to_results = lambda: self._select_tab(1)
-        
-        # Build tab buttons
-        self.tab_bar = ft.Container(
-            content=ft.Row(
-                controls=self._build_tab_buttons(),
-                spacing=0,
-            ),
-            border=ft.Border.only(bottom=ft.border.BorderSide(1, ft.Colors.ON_SURFACE_VARIANT)),
-        )
-        
-        # Content area - delay access until tabs are ready
-        self.content_area = ft.Container(expand=True)
-        
-        super().__init__(
-            content=ft.Column([
-                self.tab_bar,
-                self.content_area,
-            ], spacing=0),
-            expand=True,
-        )
-        
-        # Set initial content after super().__init__ is called
-        first_tab = next((t for t in self.tabs_list if t is not None), None)
-        if first_tab:
-            self.content_area.content = first_tab.content
-    
-    def _build_tab_buttons(self) -> list:
-        buttons = []
-        for i, tab in enumerate(self.tabs_list):
-            if tab is None:
-                continue
-            btn = StyledTabButton(
-                label=tab.label or f"Tab {i+1}",
-                icon=tab.icon,
-                is_selected=(i == self.selected_index),
-                on_click=lambda idx=i: self._select_tab(idx)
-            )
-            self.tab_buttons.append(btn)
-            buttons.append(btn)
-        return buttons
-    
-    def _select_tab(self, index: int):
-        if index >= len(self.tabs_list) or self.tabs_list[index] is None:
-            return
-        self.selected_index = index
-        self.content_area.content = self.tabs_list[index].content
-        
-        # Update button styles
-        for i, btn in enumerate(self.tab_buttons):
-            btn.set_selected(i == index)
-        
-        if self.on_change:
-            self.on_change(index)
-
-
-def main(page: ft.Page):
-    page.title = "DINOv2 Duplicate Finder"
-    page.window_width = 1000
-    page.window_height = 700
-    page.theme_mode = ft.ThemeMode.LIGHT
-    
-    # State
-    finder = DuplicatesFinder()
-    results_tab = ResultsTab()
-    
-    def on_results_ready(results):
-        results_tab.update_results(results)
-    
-    # Create search tab first (with reference to tabs_control)
-    tabs_control = None  # Will be set after creation
-    
-    search_tab = SearchTab(finder, on_results_ready=on_results_ready, switch_tabs_callback=lambda: tabs_control._select_tab(1) if tabs_control else None)
-    
-    # Add progress dialog to page overlay
-    page.overlay.append(search_tab.progress_dialog)
-    
-    # Custom tabs control with both tabs
-    tabs_control = TabsControl([search_tab, results_tab])
-    
-    page.add(tabs_control)
-    page.update()
+    def build(self):
+        # Window size
+        Window.size = (1000, 700)
+        # Load KV rules for all custom widget classes
+        Builder.load_file('app.kv')
+        # Build screen manager with screens
+        sm = ScreenManager()
+        sm.add_widget(SearchScreen(name='search'))
+        sm.add_widget(ResultsScreen(name='results'))
+        return sm
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    DinoDuplicateApp().run()
