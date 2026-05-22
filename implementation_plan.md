@@ -1,138 +1,86 @@
-# Implementation Plan: SQLite Cache for DINOv2 Embeddings and SIFT Features
+# Implementation Plan
 
 [Overview]
-Добавить SQLite кэш для DINOv2 эмбеддингов и SIFT характеристик (keypoints + descriptors) в `DuplicatesFinder`, чтобы избежать пересчета при повторных запусках и между разными директориями.
+Добавить lossless сжатие BLOB-ов в FeatureCache через zlib и кнопку ручной очистки кеша в UI.
 
-Сейчас эмбеддинги DINOv2 вычисляются каждый раз заново (строка 216 `duplicates_finder.py`), а SIFT кэшируется только in-memory (`_sift_cache`, строка 132) и сбрасывается при перезапуске. Нужен персистентный SQLite кэш, который хранит оба типа данных, проверяет `mtime` файла и автоматически инвалидирует устаревшие записи.
-
-База данных будет одна (`feature_cache.db`) в корне проекта, с таблицами для embeddings и sift, плюс поддержка многопоточного доступа через WAL режим.
+Существующая база feature_cache.db весит ~102 MB после сканирования 50 фото. 99% объёма занимают SIFT-дескрипторы — массивы float32 (128-dim), сохраняемые через `tobytes()` без сжатия. zlib level 6 сжимает такие данные в ~2-3 раза без потерь. Одновременно добавляется кнопка "Clear Cache" на экране Search, которая удаляет все записи из обеих таблиц и выполняет VACUUM, освобождая место на диске. Автоматическая очистка не делается — только по запросу пользователя через UI.
 
 [Types]
-Новый класс `FeatureCache` с методами для get/set эмбеддингов и SIFT-дескрипторов.
+Один новый enum не требуется, все изменения — в существующих классах и методах.
 
-- `FeatureCache` — менеджер SQLite кэша
-  - `db_path: str` — путь к файлу БД (по умолчанию `feature_cache.db` в CWD)
-  - `__init__(db_path: str = "feature_cache.db")` — открывает/создает БД, включает WAL
-  - `get_embedding(path: str) -> Optional[Tuple[float, np.ndarray]]` — возвращает `(mtime, embedding)` или None
-  - `set_embedding(path: str, mtime: float, embedding: np.ndarray)` — сохраняет эмбеддинг
-  - `remove_entries_not_in(paths: Set[str])` — удаляет записи для файлов, которых больше нет
-  - `get_sift(path: str) -> Optional[Tuple[float, Tuple, np.ndarray]]` — возвращает `(mtime, keypoints, descriptors)` или None
-  - `set_sift(path: str, mtime: float, keypoints: Tuple, descriptors: np.ndarray)` — сохраняет SIFT
-  - `close()` — закрывает соединение
-
-Внутренние структуры:
-- `_keypoints_to_bytes(kp: Tuple[cv2.KeyPoint]) -> bytes` — сериализует KeyPoint список в бинарный формат
-  - Формат: `[count(int32)] + для каждого KeyPoint: [angle(float32), size(float32), response(float32), octave(int32), class_id(int32), pt_x(float32), pt_y(float32)]`
-- `_bytes_to_keypoints(data: bytes) -> Tuple[cv2.KeyPoint]` — десериализует обратно
-- `_descriptors_to_bytes(des: np.ndarray) -> bytes` — `des.tobytes()`
-- `_bytes_to_descriptors(data: bytes, shape_str: str) -> np.ndarray` — `np.frombuffer(data).reshape(shape)`
-
-Схема SQLite:
-```sql
-CREATE TABLE IF NOT EXISTS embeddings (
-    path TEXT PRIMARY KEY,
-    mtime REAL NOT NULL,
-    embedding BLOB NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS sift (
-    path TEXT PRIMARY KEY,
-    mtime REAL NOT NULL,
-    keypoints BLOB,
-    keypoints_count INTEGER DEFAULT 0,
-    descriptors BLOB,
-    descriptors_shape TEXT,  -- "N,128"
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-```
+Новый метод `clear_all()` в `FeatureCache`:
+  - Удаляет все строки из `embeddings` и `sift`.
+  - Выполняет `VACUUM` для возврата места ОС.
+  - Возвращает размер freed_bytes.
 
 [Files]
-Один новый файл; minimal changes to existing files.
+Три файла изменяются, один остаётся без изменений.
 
-- **Новый файл: `feature_cache.py`** — класс `FeatureCache` с SQLite операциями
-- **Изменения в `duplicates_finder.py`**:
-  - Добавить `from feature_cache import FeatureCache` в импорты
-  - Добавить `self._cache = FeatureCache()` в `__init__`
-  - Модифицировать `embed_image()` — проверять кэш перед вычислением, сохранять после
-  - Модифицировать `_get_sift_features()` — проверять кэш перед SIFT, сохранять после
-  - Добавить очистку кэша от stale файлов после поиска
-- **Без изменений**: `app.py`, `app.kv`, `check_geometric_consistency.py`, `config.json`
+- `feature_cache.py` (изменяется)
+  - Во все методы, читающие BLOB-ы (`get_embedding`, `get_sift`), добавляется `zlib.decompress()`.
+  - Во все методы, пишущие BLOB-ы (`set_embedding`, `set_sift`), добавляется `zlib.compress()`.
+  - `_init_db()`: добавить PRAGMA `auto_vacuum=INCREMENTAL` для новых баз.
+  - Новый метод `clear_all()`: DELETE FROM обеих таблиц + VACUUM.
+  - Удалить `remove_entries_not_in()` — не используется.
+  - Вспомогательная константа `COMPRESSION_LEVEL = 6`.
+
+- `duplicates_finder.py` (изменяется)
+  - Удалить блок очистки stale cache (строки 380-385, вызов `self._cache.remove_entries_not_in(path_set)`).
+  - Удалить саму переменную `path_set`.
+
+- `app.py` (изменяется)
+  - В `SearchScreen` добавить метод `on_clear_cache()`:
+    - Показывает Popup подтверждения "Очистить кеш? Это удалит все сохранённые эмбеддинги и SIFT-дескрипторы.".
+    - При подтверждении — запускает `self.finder._cache.clear_all()` в background thread с ProgressPopup.
+    - После завершения — закрывает popup.
+  - Импорт добавить не требуется (`.kv` вызывает метод напрямую).
+
+- `app.kv` (изменяется)
+  - На SearchScreen, после кнопки `find_button`, добавить кнопку `Clear Cache`:
+    - text: "Clear Cache"
+    - background_color: 0.8, 0.2, 0.2, 1.0 (красный)
+    - on_release: `root.on_clear_cache()`
 
 [Functions]
-Только новые функции в новом файле; две существующие функции модифицируются.
-
-Новые функции в `feature_cache.py`:
-- `FeatureCache.__init__(self, db_path: str = "feature_cache.db")` — инициализация БД
-- `FeatureCache._init_db(self)` — создание таблиц и прагм
-- `FeatureCache.get_embedding(self, path: str) -> Optional[Tuple[float, np.ndarray]]`
-- `FeatureCache.set_embedding(self, path: str, mtime: float, embedding: np.ndarray)`
-- `FeatureCache.get_sift(self, path: str) -> Optional[Tuple[float, Tuple, np.ndarray]]`
-- `FeatureCache.set_sift(self, path: str, mtime: float, keypoints: Tuple, descriptors: np.ndarray)`
-- `FeatureCache.remove_entries_not_in(self, paths: Set[str])` — чистка
-- `FeatureCache.close(self)` — закрытие коннекта
-- `FeatureCache._keypoints_to_bytes(keypoints) -> bytes` — сериализация
-- `FeatureCache._bytes_to_keypoints(data: bytes) -> Tuple`
-- `FeatureCache._descriptors_to_bytes(descriptors) -> bytes`
-- `FeatureCache._bytes_to_descriptors(data: bytes, shape_str: str) -> np.ndarray`
-
-Модифицированные функции в `duplicates_finder.py`:
-- `DuplicatesFinder.__init__` — добавляет `self._cache = FeatureCache()`
-- `DuplicatesFinder.embed_image` — проверяет `mtime` файла, если кэш совпадает — возвращает сохраненный эмбеддинг; иначе вычисляет и сохраняет
-- `DuplicatesFinder._get_sift_features` — проверяет `mtime`, если кэш актуален — возвращает сохраненные keypoints/descriptors; иначе извлекает SIFT и сохраняет
-- `DuplicatesFinder.find_duplicates` — после завершения вызывает `self._cache.remove_entries_not_in(current_paths)` для очистки
+- `FeatureCache.__init__` — модифицируется: добавить `COMPRESSION_LEVEL = 6`.
+- `FeatureCache._init_db` — модифицируется: добавить `PRAGMA auto_vacuum=INCREMENTAL`.
+- `FeatureCache.get_embedding` — модифицируется: `np.frombuffer(zlib.decompress(blob))`.
+- `FeatureCache.set_embedding` — модифицируется: `zlib.compress(blob, COMPRESSION_LEVEL)`.
+- `FeatureCache.get_sift` — модифицируется: `zlib.decompress(kp_blob)`, `zlib.decompress(des_blob)`.
+- `FeatureCache.set_sift` — модифицируется: `zlib.compress(kp_blob)`, `zlib.compress(des_blob)`.
+- `FeatureCache.remove_entries_not_in` — удаляется (больше не вызывается нигде).
+- `FeatureCache.clear_all()` — новый метод: DELETE + VACUUM.
+- `DuplicatesFinder.find_duplicates` — модифицируется: удаляются строки 380-385 (stale cache cleanup).
+- `SearchScreen.on_clear_cache` — новый метод в `app.py`.
 
 [Classes]
-Один новый класс; один существующий класс модифицируется.
-
-Новый класс:
-- **`FeatureCache`** (новый файл `feature_cache.py`) — обертка над sqlite3
-  - `__init__(db_path)`, `close()`
-  - `get_embedding(path)`, `set_embedding(path, mtime, embedding)`
-  - `get_sift(path)`, `set_sift(path, mtime, keypoints, descriptors)`
-  - `remove_entries_not_in(paths)`
-  - Приватные методы сериализации
-
-Модифицированный класс:
-- **`DuplicatesFinder`** (файл `duplicates_finder.py`):
-  - Поле `self._cache: FeatureCache` в `__init__`
-  - `embed_image()` теперь использует кэш (функция остается методом класса)
-  - `_get_sift_features()` теперь использует кэш вместо только `_sift_cache`
-  - `find_duplicates()` в конце вызывает чистку кэша
+- `FeatureCache` в `feature_cache.py`:
+  - Модифицируется: в `_init_db` добавляется `auto_vacuum=INCREMENTAL`.
+  - Удаляется: метод `remove_entries_not_in`.
+  - Добавляется: метод `clear_all(self) -> int`.
+- `DuplicatesFinder` в `duplicates_finder.py`:
+  - Модифицируется `find_duplicates`: убирается блок очистки stale cache (строки 380-385).
+- `SearchScreen` в `app.py`:
+  - Добавляется метод `on_clear_cache`.
+- Никакие классы не удаляются.
 
 [Dependencies]
-Одна новая стандартная зависимость — sqlite3 (встроена в Python).
-
-- `sqlite3` — встроенный модуль Python, не требует установки
-- Никаких новых внешних пакетов
-- Изменений в `install.txt` и `README.md` не требуется
+Никакие внешние пакеты не требуются — `zlib` входит в стандартную библиотеку Python.
 
 [Testing]
-Проверить корректность кэша на реальных данных.
+Никакие существующие тесты не затрагиваются, так как тестов в репозитории нет.
 
-- Запустить поиск на папке с изображениями, убедиться что результаты совпадают до и после добавления кэша (сравнить группы)
-- Запустить повторно — проверить что эмбеддинги и SIFT берутся из кэша (время выполнения должно быть значительно меньше)
-- Добавить новый файл в папку — проверить что он будет обработан, а старые взяты из кэша
-- Удалить файл из папки — проверить что кэш очищается (запись удаляется при вызове remove_entries_not_in)
-- Проверить многопоточный доступ (WAL mode)
+Валидация:
+1. Запустить приложение, нажать Find Duplicates — убедиться, что поиск работает.
+2. Проверить размер базы до/после сжатия: `feature_cache.db` должен уменьшиться в ~2-3 раза.
+3. Нажать Clear Cache — убедиться, что после подтверждения база очищается и VACUUM возвращает место.
+4. Проверить, что повторный поиск после очистки работает корректно (кеш пересоздаётся, сжатие применяется).
 
 [Implementation Order]
-Создать сериализацию KeyPoints, затем FeatureCache, затем интеграция в DuplicatesFinder.
+Один коммит со всеми изменениями в логическом порядке.
 
-1. Создать `feature_cache.py`:
-   - Написать `_keypoints_to_bytes` и `_bytes_to_keypoints` (сериализация KeyPoint)
-   - Написать `_descriptors_to_bytes` и `_bytes_to_descriptors`
-   - Написать `__init__`, `_init_db`, `close`
-   - Написать `get_embedding` / `set_embedding`
-   - Написать `get_sift` / `set_sift`
-   - Написать `remove_entries_not_in`
-2. Модифицировать `duplicates_finder.py`:
-   - Добавить `import` и `self._cache` в `__init__`
-   - Модифицировать `embed_image()`: добавить проверку mtime + кэш
-   - Модифицировать `_get_sift_features()`: заменить in-memory cache на FeatureCache
-   - Добавить вызов чистки кэша в `find_duplicates()`
-3. Проверить синтаксис (`python -m py_compile feature_cache.py`)
-4. Протестировать end-to-end запуск через app
+1. Изменить `feature_cache.py`: добавить zlib сжатие во все 4 метода get/set, заменить `remove_entries_not_in` на `clear_all`, добавить `auto_vacuum=INCREMENTAL` в `_init_db`.
+2. Изменить `duplicates_finder.py`: удалить stale cache cleanup (строки 380-385).
+3. Изменить `app.py`: добавить метод `on_clear_cache` в SearchScreen.
+4. Изменить `app.kv`: добавить кнопку Clear Cache в SearchScreen.
+5. Проверить, что приложение запускается и все функции работают.

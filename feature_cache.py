@@ -4,6 +4,7 @@ Feature Cache - SQLite persistent cache for DINOv2 embeddings and SIFT features
 import os
 import sqlite3
 import struct
+import zlib
 from typing import Tuple, Optional, Set, List
 
 import cv2
@@ -69,6 +70,8 @@ def _bytes_to_descriptors(data: bytes, shape_str: str) -> np.ndarray:
 class FeatureCache:
     """SQLite persistent cache for image features (embeddings + SIFT)"""
 
+    COMPRESSION_LEVEL = 6
+
     def __init__(self, db_path: str = "feature_cache.db"):
         self.db_path = db_path
         self._conn = None
@@ -83,6 +86,7 @@ class FeatureCache:
         )
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS embeddings (
@@ -116,12 +120,12 @@ class FeatureCache:
         if row is None:
             return None
         mtime, blob = row
-        embedding = np.frombuffer(blob, dtype=np.float32).copy()
+        embedding = np.frombuffer(zlib.decompress(blob), dtype=np.float32).copy()
         return (mtime, embedding)
 
     def set_embedding(self, path: str, mtime: float, embedding: np.ndarray):
         """Save embedding to cache"""
-        blob = embedding.astype(np.float32).tobytes()
+        blob = zlib.compress(embedding.astype(np.float32).tobytes(), self.COMPRESSION_LEVEL)
         self._conn.execute(
             "INSERT OR REPLACE INTO embeddings (path, mtime, embedding) VALUES (?, ?, ?)",
             (path, mtime, blob)
@@ -138,8 +142,8 @@ class FeatureCache:
         if row is None:
             return None
         mtime, kp_blob, kp_count, des_blob, des_shape_str = row
-        keypoints = _bytes_to_keypoints(kp_blob)
-        descriptors = _bytes_to_descriptors(des_blob, des_shape_str) if des_blob else None
+        keypoints = _bytes_to_keypoints(zlib.decompress(kp_blob))
+        descriptors = _bytes_to_descriptors(zlib.decompress(des_blob), des_shape_str) if des_blob else None
         return (mtime, keypoints, descriptors)
 
     def set_sift(
@@ -150,8 +154,8 @@ class FeatureCache:
         descriptors: np.ndarray
     ):
         """Save SIFT features to cache"""
-        kp_blob = _keypoints_to_bytes(keypoints)
-        des_blob = _descriptors_to_bytes(descriptors) if descriptors is not None else None
+        kp_blob = zlib.compress(_keypoints_to_bytes(keypoints), self.COMPRESSION_LEVEL)
+        des_blob = zlib.compress(_descriptors_to_bytes(descriptors), self.COMPRESSION_LEVEL) if descriptors is not None else None
         des_shape = f"{descriptors.shape[0]},{descriptors.shape[1]}" if descriptors is not None else "0,0"
 
         self._conn.execute(
@@ -162,24 +166,24 @@ class FeatureCache:
         )
         self._conn.commit()
 
-    def remove_entries_not_in(self, paths: Set[str]):
-        """Remove cache entries for files that are no longer present"""
-        if not paths:
-            # If no paths provided, clear everything
-            self._conn.execute("DELETE FROM embeddings")
-            self._conn.execute("DELETE FROM sift")
-        else:
-            # Build placeholders for IN clause
-            placeholders = ','.join('?' for _ in paths)
-            self._conn.execute(
-                f"DELETE FROM embeddings WHERE path NOT IN ({placeholders})",
-                list(paths)
-            )
-            self._conn.execute(
-                f"DELETE FROM sift WHERE path NOT IN ({placeholders})",
-                list(paths)
-            )
+    def clear_all(self) -> int:
+        """Delete all cached entries and VACUUM to reclaim disk space.
+        
+        Returns:
+            Number of bytes freed (approximate, based on page count before/after).
+        """
+        before_pages = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
+
+        self._conn.execute("DELETE FROM embeddings")
+        self._conn.execute("DELETE FROM sift")
         self._conn.commit()
+        self._conn.execute("VACUUM")
+        self._conn.commit()
+
+        after_pages = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        freed = (before_pages - after_pages) * page_size
+        return freed
 
     def close(self):
         """Close database connection"""

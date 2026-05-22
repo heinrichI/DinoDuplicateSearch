@@ -5,7 +5,7 @@ Uses DINOv2 embeddings + Agglomerative Clustering + SIFT/WGC geometric verificat
 import os
 import time
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional, Set
+from typing import List, Dict, Tuple
 import cv2
 import numpy as np
 import torch
@@ -377,13 +377,6 @@ class DuplicatesFinder:
                 if group.pairs:
                     groups.append(group)
         
-        # Clean up stale cache entries (files no longer in folder)
-        try:
-            path_set = set(paths)
-            self._cache.remove_entries_not_in(path_set)
-        except Exception:
-            pass
-
         if progress_callback:
             progress_callback(100, f"Found {len(groups)} duplicate groups")
         

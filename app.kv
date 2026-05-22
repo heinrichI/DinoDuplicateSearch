@@ -120,6 +120,17 @@
             background_color: 0.2, 0.6, 1.0, 1.0
             on_release: root.on_find_duplicates()
 
+        # Clear Cache button
+        Button:
+            id: clear_cache_button
+            text: 'Clear Cache'
+            font_size: 14
+            size_hint_y: None
+            height: 40
+            background_color: 0.8, 0.2, 0.2, 1.0
+            color: 1, 1, 1, 1
+            on_release: root.on_clear_cache()
+
         # Spacer
         Widget:
             size_hint_y: 1
@@ -170,6 +181,10 @@
             id: results_scroll
             do_scroll_x: False
             do_scroll_y: True
+            bar_width: 10
+            bar_color: 0.4, 0.4, 0.4, 1
+            bar_inactive_color: 0.7, 0.7, 0.7, 1
+            scroll_type: ['bars', 'content']
 
             GridLayout:
                 id: results_grid

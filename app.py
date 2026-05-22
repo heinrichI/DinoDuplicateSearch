@@ -18,6 +18,7 @@ from kivy.uix.image import Image as KivyImage
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.label import Label
+from kivy.uix.widget import Widget
 from kivy.clock import Clock
 from kivy.properties import StringProperty
 from kivy.core.window import Window
@@ -226,6 +227,89 @@ class SearchScreen(Screen):
 
         # Switch to results tab
         self.manager.current = 'results'
+
+    def on_clear_cache(self):
+        """Show confirmation popup and clear the feature cache"""
+        from kivy.uix.boxlayout import BoxLayout as KivyBoxLayout
+        from kivy.uix.button import Button
+
+        content = KivyBoxLayout(orientation='vertical', spacing=10, padding=10)
+        content.add_widget(Label(
+            text="Clear all cached embeddings and SIFT features?\n"
+                 "This will free disk space, but the next scan will\n"
+                 "need to recompute everything."
+        ))
+        btn_layout = KivyBoxLayout(spacing=10, size_hint_y=None, height=40)
+        btn_layout.add_widget(Widget())
+        cancel_btn = Button(text='Cancel')
+        confirm_btn = Button(text='Clear Cache', background_color=(0.8, 0.2, 0.2, 1.0))
+        btn_layout.add_widget(cancel_btn)
+        btn_layout.add_widget(confirm_btn)
+        content.add_widget(btn_layout)
+
+        popup = Popup(
+            title="Clear Cache",
+            content=content,
+            size_hint=(0.6, 0.35),
+            auto_dismiss=False
+        )
+        cancel_btn.bind(on_release=popup.dismiss)
+
+        def do_clear(instance):
+            popup.dismiss()
+            self._run_clear_cache()
+
+        confirm_btn.bind(on_release=do_clear)
+        popup.open()
+
+    def _run_clear_cache(self):
+        """Run cache clearing in background thread"""
+        self.ids.find_button.disabled = True
+        self.ids.find_button.text = "Clearing cache..."
+
+        # Show progress popup
+        self._progress_popup = ProgressPopup()
+        self._progress_popup.title = "Clearing cache..."
+        self._progress_popup.open()
+        self._progress_popup.ids.progress_bar.value = 0.0
+        self._progress_popup.ids.stage_label.text = "Deleting cache entries..."
+        self._progress_popup.ids.file_label.text = ""
+
+        def clear_thread():
+            try:
+                freed = self.finder._cache.clear_all()
+                Clock.schedule_once(lambda dt: self._on_clear_done(freed), 0)
+            except Exception as ex:
+                traceback.print_exc()
+                Clock.schedule_once(lambda dt: self._on_clear_error(str(ex)), 0)
+
+        self.search_thread = threading.Thread(target=clear_thread, daemon=True)
+        self.search_thread.start()
+
+    def _on_clear_done(self, freed_bytes: int):
+        """Called after cache is cleared successfully"""
+        if self._progress_popup:
+            self._progress_popup.dismiss()
+            self._progress_popup = None
+        self.ids.find_button.disabled = False
+        self.ids.find_button.text = "Find Duplicates"
+
+        freed_mb = freed_bytes / (1024 * 1024)
+        popup = Popup(
+            title="Cache Cleared",
+            content=Label(text=f"Cache cleared successfully.\n{freed_mb:.1f} MB freed."),
+            size_hint=(0.5, 0.25)
+        )
+        popup.open()
+
+    def _on_clear_error(self, error_msg: str):
+        """Called on cache clearing error"""
+        if self._progress_popup:
+            self._progress_popup.dismiss()
+            self._progress_popup = None
+        self.ids.find_button.disabled = False
+        self.ids.find_button.text = "Find Duplicates"
+        self._show_error(f"Failed to clear cache: {error_msg}")
 
     def _show_error(self, message: str):
         """Show error message in a popup"""
